@@ -8,6 +8,15 @@ using Windows.Media.Control;
 namespace Quick_Media_Controls.Services
 {
     /// <summary>
+    /// A snapshot of the current track's playback position.
+    /// </summary>
+    public readonly record struct PlaybackTimeline(TimeSpan Position, TimeSpan Duration, bool CanSeek)
+    {
+        public static PlaybackTimeline Empty => new(TimeSpan.Zero, TimeSpan.Zero, false);
+        public bool HasDuration => Duration > TimeSpan.Zero;
+    }
+
+    /// <summary>
     /// Manages Windows media session interactions and monitors session changes.
     /// </summary>
     public class MediaSessionService : IDisposable
@@ -479,6 +488,65 @@ namespace Quick_Media_Controls.Services
             finally
             {
                 _sessionChangeLock.Release();
+            }
+        }
+
+        /// <summary>
+        /// Gets the current position and length of the track. While playing, the position is advanced
+        /// from the time the player last reported it, so callers can poll it smoothly.
+        /// </summary>
+        public PlaybackTimeline GetTimeline()
+        {
+            try
+            {
+                var session = CurrentSession;
+                if (session == null) return PlaybackTimeline.Empty;
+
+                var timeline = session.GetTimelineProperties();
+                if (timeline == null) return PlaybackTimeline.Empty;
+
+                var duration = timeline.EndTime - timeline.StartTime;
+                if (duration <= TimeSpan.Zero) return PlaybackTimeline.Empty;
+
+                var position = timeline.Position - timeline.StartTime;
+                var info = CurrentPlaybackInfo;
+
+                if (info?.PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
+                {
+                    var elapsed = DateTimeOffset.Now - timeline.LastUpdatedTime;
+                    if (elapsed > TimeSpan.Zero && elapsed < duration)
+                    {
+                        double rate = info.PlaybackRate ?? 1.0;
+                        position += TimeSpan.FromTicks((long)(elapsed.Ticks * rate));
+                    }
+                }
+
+                if (position < TimeSpan.Zero) position = TimeSpan.Zero;
+                if (position > duration) position = duration;
+
+                bool canSeek = info?.Controls?.IsPlaybackPositionEnabled ?? false;
+                return new PlaybackTimeline(position, duration, canSeek);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error reading timeline: {ex.Message}");
+                return PlaybackTimeline.Empty;
+            }
+        }
+
+        public async Task SeekAsync(TimeSpan position)
+        {
+            try
+            {
+                var session = CurrentSession;
+                if (session == null) return;
+
+                var start = session.GetTimelineProperties()?.StartTime ?? TimeSpan.Zero;
+                await session.TryChangePlaybackPositionAsync((start + position).Ticks);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error seeking: {ex.Message}");
             }
         }
 

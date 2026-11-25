@@ -36,9 +36,13 @@
 		<PackageReference Include="WPF-UI" Version="4.2.0" />
 		<PackageReference Include="WPF-UI.Tray" Version="4.2.0" />
 		<PackageReference Include="Autoupdater.NET.Official" Version="1.9.2" />
+		<PackageReference Include="NAudio.Wasapi" Version="2.2.1" />
 	</ItemGroup>
 
 	<ItemGroup>
+		<Resource Include="Assets\Fonts\GoogleSansFlex-Regular.ttf" />
+		<Resource Include="Assets\Fonts\GoogleSansFlex-Medium.ttf" />
+		<Content Include="Assets\Fonts\OFL.txt" CopyToOutputDirectory="PreserveNewest" />
 		<Resource Include="Assets\banner.jpg" />
 		<Resource Include="Assets\logo.png" />
 		<Resource Include="Assets\Icons\pauseLight.ico" />

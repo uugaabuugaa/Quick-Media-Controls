@@ -12,6 +12,7 @@ using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using Wpf.Ui.Appearance;
 using Wpf.Ui.Controls;
 using Application = System.Windows.Application;
@@ -19,7 +20,7 @@ using Cursors = System.Windows.Input.Cursors;
 
 namespace Quick_Media_Controls
 {
-    public partial class MediaFlyout : FluentWindow
+    public partial class MediaFlyout : Window
     {
         private readonly MediaSessionService _sessionManager;
         private AppSettings _appSettings;
@@ -27,10 +28,26 @@ namespace Quick_Media_Controls
         private bool _isAnimatingClose;
         private double _homeTop;
         private const double FlyoutScreenMargin = 11;
-        private const double MinFlyoutWidth = 350;
-        private const double MaxFlyoutWidth = 360;
-        private const double MinFlyoutHeight = 96;
-        private const double MaxFlyoutHeight = 112;
+        private const double MinFlyoutWidth = 332;
+        private const double MaxFlyoutWidth = 332;
+        private const double MinFlyoutHeight = 384;
+        private const double MaxFlyoutHeight = 384;
+
+        private const double VolumeSliderHostExpandedHeight = 96;
+        private const double ShadowPadding = 16;
+
+        private readonly AppVolumeService _volumeService = new();
+        private readonly DispatcherTimer _playbackTimer = new() { Interval = TimeSpan.FromMilliseconds(500) };
+        private readonly DispatcherTimer _volumeCollapseTimer = new() { Interval = TimeSpan.FromMilliseconds(350) };
+        private bool _isSeeking;
+        private bool _updatingSeekUi;
+        private DateTime _ignoreTimelineUntilUtc = DateTime.MinValue;
+        private bool _isVolumeDragging;
+        private bool _updatingVolumeUi;
+        private bool _volumeAvailable;
+        private bool _volumeIsMuted;
+        private bool _volumePillExpanded;
+        private int _volumeSyncTick;
 
         private FlyoutPalette? _currentPalette;
         private BitmapImage? _currentThumbnail;
@@ -83,6 +100,16 @@ namespace Quick_Media_Controls
 
             InitializeComponent();
             PositionFlyoutOnPrimaryScreen();
+
+            _playbackTimer.Tick += PlaybackTimer_Tick;
+            _volumeCollapseTimer.Tick += VolumeCollapseTimer_Tick;
+            IsVisibleChanged += OnFlyoutVisibleChanged;
+
+            // Slider and track clicks are handled by the slider itself, so listen even when handled.
+            SeekSlider.AddHandler(UIElement.PreviewMouseLeftButtonDownEvent, new MouseButtonEventHandler(SeekSlider_PreviewMouseLeftButtonDown), true);
+            SeekSlider.AddHandler(UIElement.PreviewMouseLeftButtonUpEvent, new MouseButtonEventHandler(SeekSlider_PreviewMouseLeftButtonUp), true);
+            VolumeSlider.AddHandler(UIElement.PreviewMouseLeftButtonDownEvent, new MouseButtonEventHandler(VolumeSlider_PreviewMouseLeftButtonDown), true);
+            VolumeSlider.AddHandler(UIElement.PreviewMouseLeftButtonUpEvent, new MouseButtonEventHandler(VolumeSlider_PreviewMouseLeftButtonUp), true);
 
             PlayPauseButton.MouseEnter += PlayPauseButton_MouseEnter;
             PlayPauseButton.MouseLeave += PlayPauseButton_MouseLeave;
@@ -139,8 +166,8 @@ namespace Quick_Media_Controls
             Width = Math.Clamp(workWidthDip * 0.25, MinFlyoutWidth, MaxFlyoutWidth);
             Height = Math.Clamp(workHeightDip * 0.155, MinFlyoutHeight, MaxFlyoutHeight);
 
-            double defaultLeft = workLeftDip + workWidthDip - Width - FlyoutScreenMargin;
-            double defaultTop = workTopDip + workHeightDip - Height - FlyoutScreenMargin;
+            double defaultLeft = workLeftDip + workWidthDip - Width - FlyoutScreenMargin + ShadowPadding;
+            double defaultTop = workTopDip + workHeightDip - Height - FlyoutScreenMargin + ShadowPadding;
 
             if (_appSettings.General.FlyoutPositionX.HasValue && _appSettings.General.FlyoutPositionY.HasValue)
             {
@@ -226,8 +253,8 @@ namespace Quick_Media_Controls
                 playingMediaThumbnail.Source = thumbnail;
 
                 var mediaTitle = _sessionManager.CurrentMediaProperties.Title;
-                playingMediaTitle.Text = mediaTitle.Length > 28 ? mediaTitle[..28] + "..." : mediaTitle;
-                playingMediaTitle.ToolTip = (mediaTitle.Length > 28) ? mediaTitle : null;
+                playingMediaTitle.Text = mediaTitle;
+                playingMediaTitle.ToolTip = mediaTitle.Length > 22 ? mediaTitle : null;
                 playingMediaArtist.Text = _sessionManager.CurrentMediaProperties.Artist;
 
                 await ApplyFlyoutThemeAsync(thumbnail);
@@ -241,7 +268,12 @@ namespace Quick_Media_Controls
 
             UpdateIcons();
 
-            if (!IsVisible)
+            if (IsVisible)
+            {
+                UpdateTimelineUi(force: true);
+                RefreshVolumeUi();
+            }
+            else
             {
                 TrimWorkingSet();
             }
@@ -261,8 +293,8 @@ namespace Quick_Media_Controls
                 var bitmap = new BitmapImage();
                 bitmap.BeginInit();
                 bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                bitmap.DecodePixelWidth = 160;
-                bitmap.DecodePixelHeight = 160;
+                bitmap.DecodePixelWidth = 256;
+                bitmap.DecodePixelHeight = 256;
 
                 using var memStream = new MemoryStream();
                 await stream.AsStreamForRead().CopyToAsync(memStream);
@@ -396,6 +428,14 @@ namespace Quick_Media_Controls
             Root.BeginAnimation(OpacityProperty, fadeOut);
         }
 
+        protected override void OnClosed(EventArgs e)
+        {
+            _playbackTimer.Stop();
+            _volumeCollapseTimer.Stop();
+            _volumeService.Dispose();
+            base.OnClosed(e);
+        }
+
         private void Flyout_Deactivated(object sender, EventArgs e)
         {
             if (!_appSettings.General.AutoHideFlyout) return;
@@ -439,8 +479,6 @@ namespace Quick_Media_Controls
                     DynamicAmbientLayer.Visibility = Visibility.Visible;
                     BlurredArtworkLayer.Visibility = Visibility.Collapsed;
                     MinimalistGlassLayer.Visibility = Visibility.Collapsed;
-                    WindowBackdropType = WindowBackdropType.Acrylic;
-                    Root.Background = Brushes.Transparent;
 
                     ThumbnailDropShadow.Opacity = isDarkMode ? 0.32 : 0.18;
                     ThumbnailDropShadow.BlurRadius = 12;
@@ -473,10 +511,8 @@ namespace Quick_Media_Controls
                     DynamicAmbientLayer.Visibility = Visibility.Collapsed;
                     BlurredArtworkLayer.Visibility = Visibility.Visible;
                     MinimalistGlassLayer.Visibility = Visibility.Collapsed;
-                    WindowBackdropType = WindowBackdropType.Acrylic;
-                    Root.Background = Brushes.Transparent;
 
-                    BlurredArtworkImage.Source = thumbnail;
+                    BlurredArtworkImage.Source = CreateBlurSource(thumbnail);
                     BlurredArtworkImage.Opacity = isDarkMode ? 0.45 : 0.60;
                     if (thumbnail != null)
                     {
@@ -517,8 +553,6 @@ namespace Quick_Media_Controls
                     DynamicAmbientLayer.Visibility = Visibility.Collapsed;
                     BlurredArtworkLayer.Visibility = Visibility.Collapsed;
                     MinimalistGlassLayer.Visibility = Visibility.Visible;
-                    WindowBackdropType = WindowBackdropType.Acrylic;
-                    Root.Background = Brushes.Transparent;
 
                     MinimalistGlassLayer.Background = new SolidColorBrush(isDarkMode
                         ? Color.FromArgb(125, 22, 22, 28)
@@ -553,8 +587,6 @@ namespace Quick_Media_Controls
                     DynamicAmbientLayer.Visibility = Visibility.Collapsed;
                     BlurredArtworkLayer.Visibility = Visibility.Collapsed;
                     MinimalistGlassLayer.Visibility = Visibility.Collapsed;
-                    WindowBackdropType = WindowBackdropType.Mica;
-                    Root.ClearValue(System.Windows.Controls.Panel.BackgroundProperty);
 
                     ThumbnailDropShadow.Opacity = 0;
                     ThumbnailContainer.BorderThickness = new Thickness(0);
@@ -575,6 +607,8 @@ namespace Quick_Media_Controls
                     NextTrackButton.Appearance = ControlAppearance.Secondary;
                     break;
             }
+
+            await ApplyAccentColorsAsync(isDarkMode, flyoutTheme, thumbnail);
         }
 
         private void PlayPauseButton_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
@@ -642,6 +676,379 @@ namespace Quick_Media_Controls
         }
 
 
+        #region Seek bar
+
+        private void OnFlyoutVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+        {
+            if (IsVisible)
+            {
+                _playbackTimer.Start();
+                UpdateTimelineUi(force: true);
+                RefreshVolumeUi();
+            }
+            else
+            {
+                _playbackTimer.Stop();
+                _volumeCollapseTimer.Stop();
+                _isSeeking = false;
+                _isVolumeDragging = false;
+                CollapseVolumePill(immediate: true);
+            }
+        }
+
+        private void PlaybackTimer_Tick(object? sender, EventArgs e)
+        {
+            // Safety net: a mouse release outside the slider can be missed.
+            if (_isSeeking && Mouse.LeftButton == MouseButtonState.Released)
+            {
+                CommitSeek();
+            }
+
+            if (_isVolumeDragging && Mouse.LeftButton == MouseButtonState.Released)
+            {
+                _isVolumeDragging = false;
+                _volumeCollapseTimer.Start();
+            }
+
+            UpdateTimelineUi(force: false);
+
+            _volumeSyncTick++;
+            if (_volumeSyncTick % 2 == 0 && !_isVolumeDragging)
+            {
+                RefreshVolumeUi();
+            }
+        }
+
+        private void UpdateTimelineUi(bool force)
+        {
+            if (_isSeeking) return;
+            if (!force && DateTime.UtcNow < _ignoreTimelineUntilUtc) return;
+
+            var timeline = _sessionManager.GetTimeline();
+
+            _updatingSeekUi = true;
+            try
+            {
+                if (!timeline.HasDuration)
+                {
+                    SeekSlider.IsEnabled = false;
+                    SeekSlider.Opacity = 0.45;
+                    SeekSlider.Maximum = 1;
+                    SeekSlider.Value = 0;
+                    ElapsedTimeText.Text = "0:00";
+                    TotalTimeText.Text = "0:00";
+                    return;
+                }
+
+                SeekSlider.Maximum = Math.Max(1, timeline.Duration.TotalSeconds);
+                SeekSlider.Value = Math.Clamp(timeline.Position.TotalSeconds, 0, SeekSlider.Maximum);
+                SeekSlider.IsEnabled = timeline.CanSeek;
+                SeekSlider.Opacity = timeline.CanSeek ? 1.0 : 0.6;
+                ElapsedTimeText.Text = FormatTime(timeline.Position);
+                TotalTimeText.Text = FormatTime(timeline.Duration);
+            }
+            finally
+            {
+                _updatingSeekUi = false;
+            }
+        }
+
+        private static string FormatTime(TimeSpan time)
+        {
+            if (time < TimeSpan.Zero) time = TimeSpan.Zero;
+            return time.TotalHours >= 1
+                ? $"{(int)time.TotalHours}:{time.Minutes:00}:{time.Seconds:00}"
+                : $"{time.Minutes}:{time.Seconds:00}";
+        }
+
+        private void SeekSlider_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (SeekSlider.IsEnabled) _isSeeking = true;
+        }
+
+        private void SeekSlider_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            if (_isSeeking) CommitSeek();
+        }
+
+        private void SeekSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (ElapsedTimeText == null || _updatingSeekUi || !_isSeeking) return;
+            ElapsedTimeText.Text = FormatTime(TimeSpan.FromSeconds(e.NewValue));
+        }
+
+        private async void CommitSeek()
+        {
+            _isSeeking = false;
+            _ignoreTimelineUntilUtc = DateTime.UtcNow.AddMilliseconds(800);
+
+            var target = TimeSpan.FromSeconds(SeekSlider.Value);
+            ElapsedTimeText.Text = FormatTime(target);
+
+            try
+            {
+                await _sessionManager.SeekAsync(target);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex);
+            }
+        }
+
+        #endregion
+
+        #region Per-app volume
+
+        private string? GetCurrentAppId()
+        {
+            try
+            {
+                return _sessionManager.CurrentSession?.SourceAppUserModelId;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static SymbolRegular GetVolumeSymbol(float volume, bool muted)
+        {
+            if (muted || volume <= 0.001f) return SymbolRegular.SpeakerMute16;
+            if (volume < 0.5f) return SymbolRegular.Speaker116;
+            return SymbolRegular.Speaker216;
+        }
+
+        private void RefreshVolumeUi()
+        {
+            if (!IsVisible) return;
+
+            bool available = _volumeService.TryGetState(GetCurrentAppId(), out float volume, out bool muted);
+            _volumeAvailable = available;
+
+            VolumeButton.IsEnabled = available;
+            VolumePanel.Opacity = available ? 1.0 : 0.45;
+
+            if (!available)
+            {
+                if (_volumePillExpanded) CollapseVolumePill(immediate: false);
+                VolumeIcon.Symbol = SymbolRegular.Speaker216;
+                return;
+            }
+
+            _volumeIsMuted = muted;
+            UpdateVolumePercent(volume, muted);
+
+            if (!_isVolumeDragging)
+            {
+                _updatingVolumeUi = true;
+                try
+                {
+                    VolumeSlider.Value = volume;
+                }
+                finally
+                {
+                    _updatingVolumeUi = false;
+                }
+            }
+
+            VolumeIcon.Symbol = GetVolumeSymbol(volume, muted);
+        }
+
+        private void UpdateVolumePercent(float volume, bool muted)
+        {
+            VolumePercentText.Text = $"{(int)Math.Round(volume * 100)}%";
+            VolumePercentText.Opacity = muted ? 0.5 : 1.0;
+        }
+
+        private void VolumeButton_Click(object sender, RoutedEventArgs e)
+        {
+            bool newMuteState = !_volumeIsMuted;
+            if (_volumeService.TrySetMute(GetCurrentAppId(), newMuteState))
+            {
+                _volumeIsMuted = newMuteState;
+                float volume = (float)VolumeSlider.Value;
+                VolumeIcon.Symbol = GetVolumeSymbol(volume, newMuteState);
+                UpdateVolumePercent(volume, newMuteState);
+            }
+        }
+
+        private void VolumeSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (VolumeIcon == null || _updatingVolumeUi) return;
+
+            var appId = GetCurrentAppId();
+            float volume = (float)e.NewValue;
+
+            _volumeService.TrySetVolume(appId, volume);
+
+            // Moving the slider while muted should unmute, like the Windows mixer.
+            if (_volumeIsMuted && volume > 0f && _volumeService.TrySetMute(appId, false))
+            {
+                _volumeIsMuted = false;
+            }
+
+            VolumeIcon.Symbol = GetVolumeSymbol(volume, _volumeIsMuted);
+            UpdateVolumePercent(volume, _volumeIsMuted);
+        }
+
+        private void VolumeSlider_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            _isVolumeDragging = true;
+            _volumeCollapseTimer.Stop();
+        }
+
+        private void VolumeSlider_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+        {
+            _isVolumeDragging = false;
+            if (!VolumePanel.IsMouseOver) _volumeCollapseTimer.Start();
+        }
+
+        private void VolumePanel_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
+        {
+            _volumeCollapseTimer.Stop();
+            if (_volumeAvailable) ExpandVolumePill();
+        }
+
+        private void VolumePanel_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
+        {
+            if (!_isVolumeDragging) _volumeCollapseTimer.Start();
+        }
+
+        // Keeps a click on the empty part of the pill from dragging the whole flyout.
+        private void VolumePanel_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            e.Handled = true;
+        }
+
+        private void VolumeCollapseTimer_Tick(object? sender, EventArgs e)
+        {
+            _volumeCollapseTimer.Stop();
+            if (!VolumePanel.IsMouseOver && !_isVolumeDragging)
+            {
+                CollapseVolumePill(immediate: false);
+            }
+        }
+
+        private void ExpandVolumePill()
+        {
+            if (_volumePillExpanded) return;
+            _volumePillExpanded = true;
+            VolumeSlider.IsHitTestVisible = true;
+            AnimateVolumePanel(VolumeSliderHostExpandedHeight, 1.0);
+        }
+
+        private void CollapseVolumePill(bool immediate)
+        {
+            if (!_volumePillExpanded && !immediate) return;
+            _volumePillExpanded = false;
+            VolumeSlider.IsHitTestVisible = false;
+
+            if (immediate)
+            {
+                VolumeSliderHost.BeginAnimation(FrameworkElement.HeightProperty, null);
+                VolumeSlider.BeginAnimation(UIElement.OpacityProperty, null);
+                VolumeSliderHost.Height = 0;
+                VolumeSlider.Opacity = 0;
+                return;
+            }
+
+            AnimateVolumePanel(0, 0.0);
+        }
+
+        private void AnimateVolumePanel(double targetHeight, double sliderOpacity)
+        {
+            var duration = new Duration(TimeSpan.FromMilliseconds(_appSettings.General.EnableFlyoutAnimations ? 160 : 1));
+            var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+            VolumeSliderHost.BeginAnimation(FrameworkElement.HeightProperty,
+                new DoubleAnimation(targetHeight, duration) { EasingFunction = ease });
+            VolumeSlider.BeginAnimation(UIElement.OpacityProperty,
+                new DoubleAnimation(sliderOpacity, duration) { EasingFunction = ease });
+        }
+
+        #endregion
+
+        private async Task ApplyAccentColorsAsync(bool isDarkMode, FlyoutThemeSetting flyoutTheme, BitmapImage? thumbnail)
+        {
+            bool themeUsesPalette = flyoutTheme == FlyoutThemeSetting.AmbientDynamic
+                || flyoutTheme == FlyoutThemeSetting.BlurredArtwork;
+
+            FlyoutPalette palette = themeUsesPalette && _currentPalette != null
+                ? _currentPalette
+                : await ColorExtractorService.ExtractPaletteAsync(thumbnail, isDarkMode);
+
+            var tints = AccentTintService.Compute(palette.PlayButtonBrush.Color, isDarkMode);
+
+            Brush accent = FrozenBrush(tints.Accent);
+            Brush title = FrozenBrush(tints.Title);
+            Brush subtitle = FrozenBrush(tints.Subtitle);
+            Brush seekTrack = FrozenBrush(isDarkMode ? Color.FromArgb(60, 255, 255, 255) : Color.FromArgb(55, 0, 0, 0));
+            Brush volumeTrack = FrozenBrush(Color.FromArgb(77, tints.Accent.R, tints.Accent.G, tints.Accent.B));
+            Color neutral = isDarkMode ? Color.FromRgb(30, 30, 34) : Color.FromRgb(244, 244, 247);
+            double tintAmount = flyoutTheme == FlyoutThemeSetting.Default ? 0.08 : 0.16;
+            FlyoutCard.Background = FrozenBrush(AccentTintService.Blend(neutral, tints.Accent, tintAmount));
+
+            Brush circleFill = FrozenBrush(isDarkMode ? Color.FromArgb(24, 255, 255, 255) : Color.FromArgb(22, 0, 0, 0));
+
+            playingMediaTitle.Foreground = title;
+            playingMediaArtist.Foreground = subtitle;
+            ElapsedTimeText.Foreground = subtitle;
+            TotalTimeText.Foreground = subtitle;
+
+            SeekSlider.Foreground = accent;
+            SeekSlider.Background = seekTrack;
+
+            PreviousIcon.Foreground = title;
+            NextIcon.Foreground = title;
+            LockIcon.Foreground = title;
+            CycleIcon.Foreground = title;
+
+            bool themedButtons = flyoutTheme != FlyoutThemeSetting.Default;
+            Brush smallButtonFill = themedButtons ? PreviousTrackButton.Background : circleFill;
+            Brush smallButtonBorder = themedButtons ? PreviousTrackButton.BorderBrush : Brushes.Transparent;
+            LockButton.Background = smallButtonFill;
+            LockButton.BorderBrush = smallButtonBorder;
+            CycleSessionButton.Background = smallButtonFill;
+            CycleSessionButton.BorderBrush = smallButtonBorder;
+
+            if (themeUsesPalette)
+            {
+                playPauseIcon.Foreground = subtitle;
+            }
+
+            VolumeIcon.Foreground = title;
+            VolumePercentText.Foreground = subtitle;
+            VolumeSlider.Foreground = accent;
+            VolumeSlider.Background = volumeTrack;
+        }
+
+        // A very small copy of the artwork; stretching it up gives a soft blur without a live blur effect.
+        private static BitmapSource? CreateBlurSource(BitmapImage? thumbnail)
+        {
+            if (thumbnail == null || thumbnail.PixelWidth <= 0 || thumbnail.PixelHeight <= 0) return null;
+
+            try
+            {
+                const double targetSize = 24.0;
+                var small = new TransformedBitmap(thumbnail,
+                    new ScaleTransform(targetSize / thumbnail.PixelWidth, targetSize / thumbnail.PixelHeight));
+                small.Freeze();
+                return small;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to create blur source: {ex.Message}");
+                return thumbnail;
+            }
+        }
+
+        private static SolidColorBrush FrozenBrush(Color color)
+        {
+            var brush = new SolidColorBrush(color);
+            brush.Freeze();
+            return brush;
+        }
+
         private async void PlayPauseButton_ClickAsync(object sender, RoutedEventArgs e)
         {
             try
@@ -698,7 +1105,15 @@ namespace Quick_Media_Controls
             base.OnMouseLeftButtonDown(e);
             if (e.ButtonState == MouseButtonState.Pressed && _IsDragEnabled)
             {
-                DragMove();
+                try
+                {
+                    DragMove();
+                }
+                catch (InvalidOperationException)
+                {
+                    return;
+                }
+
                 _homeTop = this.Top;
 
                 _appSettings.General.FlyoutPositionX = Left;
