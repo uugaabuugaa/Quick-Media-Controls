@@ -1,4 +1,4 @@
-> **This is a fork of [ORIGINAL-AUTHOR/Quick-Media-Controls](https://github.com/ORIGINAL-AUTHOR/Quick-Media-Controls).**
+> **This is a fork of [AnasAttaullah/Quick-Media-Controls](https://github.com/ORIGINAL-AUTHOR/Quick-Media-Controls).**
 > All credit for the original app goes to its author.
 
 ### What's different in this fork
